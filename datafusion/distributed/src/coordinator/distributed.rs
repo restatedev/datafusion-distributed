@@ -266,9 +266,13 @@ impl ExecutionPlan for DistributedExec {
                 internal_datafusion_err!("DistributedExec was already prepared for execution")
             })?;
             let mut stream = head_stage.execute(partition, context)?;
+            // Send a failure through the channel too, behind the batches already
+            // waiting there. Returned from this task instead, it could reach the
+            // consumer before them.
             while let Some(msg) = stream.next().await {
-                if tx.send(Ok(msg?)).await.is_err() {
-                    break; // channel closed
+                let failed = msg.is_err();
+                if tx.send(msg).await.is_err() || failed {
+                    break; // channel closed, or the stream failed
                 }
             }
             Ok(())
@@ -279,5 +283,50 @@ impl ExecutionPlan for DistributedExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DistributedExt;
+    use crate::test_utils::mock_exec::MockExec;
+    use datafusion::arrow::array::Int32Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::common::assert_contains;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use futures::FutureExt;
+    use tokio::sync::Notify;
+
+    /// The head stage yields one row and then fails. The output is read only once
+    /// the head stage has yielded the failure, so the row is already waiting in
+    /// the output channel. A pending first read makes the next read check the
+    /// forwarding task's result before that channel: the case in which a failure
+    /// returned from the task overtook the row.
+    #[tokio::test]
+    async fn failure_follows_buffered_row() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let row = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )?;
+        let failed = Arc::new(Notify::new());
+        let head = MockExec::new(vec![Ok(row), exec_err!("late failure")], schema)
+            .with_use_task(false)
+            .with_error_notify(Arc::clone(&failed));
+        let mut config = SessionConfig::new();
+        config.set_distributed_option_extension(DistributedConfig::default());
+        let task_ctx = SessionContext::new_with_config(config).task_ctx();
+        let mut output = DistributedExec::new(Arc::new(head)).execute(0, task_ctx)?;
+
+        assert!(output.next().now_or_never().is_none());
+        failed.notified().await;
+
+        let first = output.next().await.expect("the row")?;
+        assert_eq!(first.num_rows(), 1);
+        let failure = output.next().await.expect("the failure").unwrap_err();
+        assert_contains!(failure.to_string(), "late failure");
+        Ok(())
     }
 }
